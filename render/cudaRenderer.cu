@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <vector>
+#include <stdexcept>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -55,6 +56,9 @@ __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 // file simpler and to seperate code that should not be modified
 #include "noiseCuda.cu_inl"
 #include "lookupColor.cu_inl"
+#include "circleBoxTest.cu_inl"
+#define SCAN_BLOCK_DIM 256
+#include "exclusiveScan.cu_inl"
 
 
 // kernelClearImageSnowflake -- (CUDA device code)
@@ -379,52 +383,51 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     // END SHOULD-BE-ATOMIC REGION
 }
 
-// kernelRenderCircles -- (CUDA device code)
-//
-// Each thread renders a circle.  Since there is no protection to
-// ensure order of update or mutual exclusion on the output image, the
-// resulting image will be incorrect.
+// A block owns one 16x16 pixel tile. Stable compaction preserves circle order;
+// exactly one thread owns each output pixel, so blending needs no atomics.
 __global__ void kernelRenderCircles() {
-
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (index >= cuConstRendererParams.numCircles)
-        return;
-
-    int index3 = 3 * index;
-
-    // read position and radius
-    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    float  rad = cuConstRendererParams.radius[index];
-
-    // compute the bounding box of the circle. The bound is in integer
-    // screen coordinates, so it's clamped to the edges of the screen.
-    short imageWidth = cuConstRendererParams.imageWidth;
-    short imageHeight = cuConstRendererParams.imageHeight;
-    short minX = static_cast<short>(imageWidth * (p.x - rad));
-    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-    short minY = static_cast<short>(imageHeight * (p.y - rad));
-    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
-
-    // a bunch of clamps.  Is there a CUDA built-in for this?
-    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
-
-    float invWidth = 1.f / imageWidth;
-    float invHeight = 1.f / imageHeight;
-
-    // for all pixels in the bonding box
-    for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
-        float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
-        for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
-            float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                                 invHeight * (static_cast<float>(pixelY) + 0.5f));
-            shadePixel(index, pixelCenterNorm, p, imgPtr);
-            imgPtr++;
+    const int lane = threadIdx.y * blockDim.x + threadIdx.x;
+    const int width = cuConstRendererParams.imageWidth;
+    const int height = cuConstRendererParams.imageHeight;
+    const int x = blockIdx.x * 16 + threadIdx.x;
+    const int y = blockIdx.y * 16 + threadIdx.y;
+    const bool valid = x < width && y < height;
+    const float invWidth = 1.f / width, invHeight = 1.f / height;
+    float2 center = make_float2(invWidth * (x + .5f), invHeight * (y + .5f));
+    float4 color = make_float4(0.f,0.f,0.f,0.f);
+    if (valid) color = reinterpret_cast<float4*>(cuConstRendererParams.imageData)[y*width+x];
+    __shared__ unsigned flags[256], offsets[256], scratch[512];
+    __shared__ int circles[256];
+    __shared__ unsigned count;
+    const float left = blockIdx.x * 16 * invWidth;
+    const float right = min((int(blockIdx.x)+1)*16,width) * invWidth;
+    const float bottom = blockIdx.y * 16 * invHeight;
+    const float top = min((int(blockIdx.y)+1)*16,height) * invHeight;
+    for (int base=0; base<cuConstRendererParams.numCircles; base+=256) {
+        int circle = base+lane;
+        unsigned hit=0;
+        if (circle < cuConstRendererParams.numCircles) {
+            float3 p = reinterpret_cast<float3*>(cuConstRendererParams.position)[circle];
+            hit=circleInBoxConservative(p.x,p.y,cuConstRendererParams.radius[circle],left,right,top,bottom);
         }
+        flags[lane]=hit;
+        __syncthreads();
+        sharedMemExclusiveScan(lane,flags,offsets,scratch,256);
+        __syncthreads();
+        if (hit) circles[offsets[lane]]=circle;
+        if (lane==255) count=offsets[lane]+hit;
+        __syncthreads();
+        if (valid) {
+            for (unsigned i=0; i<count; ++i) {
+                int id=circles[i];
+                float3 p=reinterpret_cast<float3*>(cuConstRendererParams.position)[id];
+                shadePixel(id,center,p,&color);
+            }
+        }
+        // Edge-tile inactive pixels must participate in every barrier too.
+        __syncthreads();
     }
+    if (valid) reinterpret_cast<float4*>(cuConstRendererParams.imageData)[y*width+x]=color;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -635,11 +638,12 @@ CudaRenderer::advanceAnimation() {
 
 void
 CudaRenderer::render() {
-
-    // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
-
-    kernelRenderCircles<<<gridDim, blockDim>>>();
-    cudaDeviceSynchronize();
+    if (!image || image->width <= 0 || image->height <= 0)
+        throw std::runtime_error("renderer requires a nonempty output image");
+    dim3 blockDim(16,16);
+    dim3 gridDim((image->width+15)/16,(image->height+15)/16);
+    kernelRenderCircles<<<gridDim,blockDim>>>();
+    cudaError_t error=cudaGetLastError();
+    if (error==cudaSuccess) error=cudaDeviceSynchronize();
+    if (error!=cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
