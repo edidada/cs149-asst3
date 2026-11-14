@@ -4,4 +4,4 @@
 
 原shadePixel、动画、辅助scan、box测试、接口/Makefile/main/checker均未修改。复杂度每tile扫描全部圆，且只对候选进行逐像素着色；固定shared memory容量，无全局候选列表上限，拥挤场景仍可能昂贵，未取得参考性能。CUDA启动/同步错误抛出。
 
-独立设备job准备7场景×6尺寸共42次CPU参考比较与compute-sanitizer，覆盖1/15/16/17/31/65的tile边界和重叠顺序；再运行原8场景checker并断言每份正确性日志含成功。无GPU runner时仅远端编译，GPU执行0次，不能称正确性或性能验收完成。本地不编译运行，无新增Python源文件。
+独立设备job准备7场景×6尺寸共42次CPU参考比较与compute-sanitizer，覆盖1/15/16/17/31/65的tile边界和重叠顺序；另准备72帧非方形/动画CPU参考及重复渲染bitwise确定性检查（RGB沿用原0.1容差但不忽略任何错误像素，alpha只检查有限值），再运行原8场景checker并断言每份正确性日志含成功。无GPU runner时仅远端编译，GPU执行0次，不能称正确性或性能验收完成。本地不编译运行，无新增Python源文件。

@@ -25,6 +25,7 @@ jobs:
           git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD > evidence/commit.txt
           nvcc --version | tee evidence/toolchain.txt
           make -C render 2>&1 | tee evidence/build.txt
+          g++ -O3 -std=c++11 -Irender tests/renderer_boundaries.cpp render/objs/cudaRenderer.o render/objs/refRenderer.o render/objs/noise.o render/objs/sceneLoader.o -L/usr/local/cuda/lib64 -lcudart -o /tmp/renderer-boundaries
           echo 'COMPILE ONLY: no GPU runtime or performance conclusion' | tee evidence/scope.txt
       - uses: actions/upload-artifact@v4
         if: always()
@@ -46,6 +47,8 @@ jobs:
           nvidia-smi | tee evidence/device.txt
           nvcc --version | tee evidence/toolchain.txt
           make -C render
+          g++ -O3 -std=c++11 -Irender tests/renderer_boundaries.cpp render/objs/cudaRenderer.o render/objs/refRenderer.o render/objs/noise.o render/objs/sceneLoader.o -L/usr/local/cuda/lib64 -lcudart -o /tmp/renderer-boundaries
+          timeout 300 compute-sanitizer --tool memcheck --error-exitcode 1 /tmp/renderer-boundaries 2>&1 | tee evidence/non-square-animated.txt
           for scene in rgb rgby rand10k pattern snowsingle biglittle littlebig; do
             for size in 1 15 16 17 31 65; do
               timeout 120 compute-sanitizer --tool memcheck --error-exitcode 1 render/render -c "$scene" -s "$size" -S 17 -f /tmp/render-check 2>&1 | tee "evidence/$scene-$size.txt"
