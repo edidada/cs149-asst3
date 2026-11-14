@@ -1,4 +1,6 @@
 #include <stdio.h>
+#include <stdexcept>
+#include <string>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -42,19 +44,71 @@ static inline int nextPow2(int n) {
 // Also, as per the comments in cudaScan(), you can implement an
 // "in-place" scan, since the timing harness makes a copy of input and
 // places it in result
-void exclusive_scan(int* input, int N, int* result)
-{
+namespace {
+void checkCuda(cudaError_t error, const char* action) {
+    if (error != cudaSuccess)
+        throw std::runtime_error(std::string(action) + ": " + cudaGetErrorString(error));
+}
+int paddedSize(int n) {
+    if (n < 0 || n > (1 << 30)) throw std::invalid_argument("unsupported scan size");
+    return n == 0 ? 0 : nextPow2(n);
+}
+__global__ void initializeScan(const int* input, int n, int size, int* output) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) output[i] = i < n ? input[i] : 0;
+}
+__global__ void upsweep(int* values, int stride, int count) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) {
+        int right = (i + 1) * (2 * stride) - 1;
+        values[right] += values[right - stride];
+    }
+}
+__global__ void downsweep(int* values, int stride, int count) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) {
+        int right = (i + 1) * (2 * stride) - 1;
+        int left = values[right - stride];
+        values[right - stride] = values[right];
+        values[right] += left;
+    }
+}
+__global__ void markRepeats(const int* input, int length, int* flags) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < length) flags[i] = i + 1 < length && input[i] == input[i+1];
+}
+__global__ void scatterRepeats(const int* input, int length, const int* offsets, int* output) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i + 1 < length && input[i] == input[i+1]) output[offsets[i]] = i;
+}
+struct Scratch {
+    int* data = nullptr;
+    explicit Scratch(int size) {
+        checkCuda(cudaMalloc(&data, sizeof(int) * static_cast<size_t>(size)), "allocate scan scratch");
+    }
+    ~Scratch() { if (data) cudaFree(data); }
+    Scratch(const Scratch&) = delete;
+    Scratch& operator=(const Scratch&) = delete;
+};
+}
 
-    // CS149 TODO:
-    //
-    // Implement your exclusive scan implementation here.  Keep in
-    // mind that although the arguments to this function are device
-    // allocated arrays, this is a function that is running in a thread
-    // on the CPU.  Your implementation will need to make multiple calls
-    // to CUDA kernel functions (that you must write) to implement the
-    // scan.
-
-
+void exclusive_scan(int* input, int N, int* result) {
+    const int size = paddedSize(N);
+    if (size == 0) return;
+    // Each index reads only itself, so initialization supports input == result.
+    initializeScan<<<(size+255)/256,256>>>(input,N,size,result);
+    checkCuda(cudaGetLastError(), "initialize scan");
+    for (int stride=1; stride<size; stride*=2) {
+        int count=size/(2*stride);
+        upsweep<<<(count+255)/256,256>>>(result,stride,count);
+        checkCuda(cudaGetLastError(), "scan upsweep");
+    }
+    checkCuda(cudaMemset(result+size-1,0,sizeof(int)), "clear scan root");
+    for (int stride=size/2; stride>0; stride/=2) {
+        int count=size/(2*stride);
+        downsweep<<<(count+255)/256,256>>>(result,stride,count);
+        checkCuda(cudaGetLastError(), "scan downsweep");
+    }
 }
 
 
@@ -148,20 +202,19 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 //
 // Returns the total number of pairs found
 int find_repeats(int* device_input, int length, int* device_output) {
-
-    // CS149 TODO:
-    //
-    // Implement this function. You will probably want to
-    // make use of one or more calls to exclusive_scan(), as well as
-    // additional CUDA kernel launches.
-    //    
-    // Note: As in the scan code, the calling code ensures that
-    // allocated arrays are a power of 2 in size, so you can use your
-    // exclusive_scan function with them. However, your implementation
-    // must ensure that the results of find_repeats are correct given
-    // the actual array length.
-
-    return 0; 
+    const int size = paddedSize(length);
+    if (length < 2) return 0;
+    Scratch offsets(size);
+    markRepeats<<<(length+255)/256,256>>>(device_input,length,offsets.data);
+    checkCuda(cudaGetLastError(), "mark repeats");
+    exclusive_scan(offsets.data,length,offsets.data);
+    // Last flag is always zero, so the last exclusive prefix is the total.
+    int count=0;
+    checkCuda(cudaMemcpy(&count,offsets.data+length-1,sizeof(int),cudaMemcpyDeviceToHost), "read repeat count");
+    scatterRepeats<<<(length+255)/256,256>>>(device_input,length,offsets.data,device_output);
+    checkCuda(cudaGetLastError(), "scatter repeats");
+    checkCuda(cudaDeviceSynchronize(), "complete repeat scatter");
+    return count;
 }
 
 
