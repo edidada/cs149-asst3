@@ -1,4 +1,6 @@
 #include <stdio.h>
+#include <stdexcept>
+#include <string>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -38,77 +40,50 @@ saxpy_kernel(int N, float alpha, float* x, float* y, float* result) {
 // memory on the GPU using CUDA API functions, uses CUDA API functions
 // to transfer data from the CPU's memory address space to GPU memory
 // address space, and launches the CUDA kernel function on the GPU.
-void saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultarray) {
-
-    // must read both input arrays (xarray and yarray) and write to
-    // output array (resultarray)
-    int totalBytes = sizeof(float) * 3 * N;
-
-    // compute number of blocks and threads per block.  In this
-    // application we've hardcoded thread blocks to contain 512 CUDA
-    // threads.
-    const int threadsPerBlock = 512;
-
-    // Notice the round up here.  The code needs to compute the number
-    // of threads blocks needed such that there is one thread per
-    // element of the arrays.  This code is written to work for values
-    // of N that are not multiples of threadPerBlock.
-    const int blocks = (N + threadsPerBlock - 1) / threadsPerBlock;
-
-    // These are pointers that will be pointers to memory allocated
-    // *one the GPU*.  You should allocate these pointers via
-    // cudaMalloc.  You can access the resulting buffers from CUDA
-    // device kernel code (see the kernel function saxpy_kernel()
-    // above) but you cannot access the contents these buffers from
-    // this thread. CPU threads cannot issue loads and stores from GPU
-    // memory!
-    float* device_x = nullptr;
-    float* device_y = nullptr;
-    float* device_result = nullptr;
-    
-    //
-    // CS149 TODO: allocate device memory buffers on the GPU using cudaMalloc.
-    //
-    // We highly recommend taking a look at NVIDIA's
-    // tutorial, which clearly walks you through the few lines of code
-    // you need to write for this part of the assignment:
-    //
-    // https://devblogs.nvidia.com/easy-introduction-cuda-c-and-c/
-    //
-        
-    // start timing after allocation of device memory
-    double startTime = CycleTimer::currentSeconds();
-
-    //
-    // CS149 TODO: copy input arrays to the GPU using cudaMemcpy
-    //
-
-   
-    // run CUDA kernel. (notice the <<< >>> brackets indicating a CUDA
-    // kernel launch) Execution on the GPU occurs here.
-    saxpy_kernel<<<blocks, threadsPerBlock>>>(N, alpha, device_x, device_y, device_result);
-
-    //
-    // CS149 TODO: copy result from GPU back to CPU using cudaMemcpy
-    //
-
-    
-    // end timing after result has been copied back into host memory
-    double endTime = CycleTimer::currentSeconds();
-
-    cudaError_t errCode = cudaPeekAtLastError();
-    if (errCode != cudaSuccess) {
-        fprintf(stderr, "WARNING: A CUDA error occured: code=%d, %s\n",
-		errCode, cudaGetErrorString(errCode));
+namespace {
+void checked(cudaError_t error, const char* operation) {
+    if (error != cudaSuccess)
+        throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(error));
+}
+struct DeviceBuffer {
+    float* data = nullptr;
+    explicit DeviceBuffer(size_t bytes) { checked(cudaMalloc(&data, bytes), "cudaMalloc"); }
+    ~DeviceBuffer() { if (data) cudaFree(data); }
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+    void release() {
+        checked(cudaFree(data), "cudaFree");
+        data = nullptr;
     }
+};
+}
 
-    double overallDuration = endTime - startTime;
-    printf("Effective BW by CUDA saxpy: %.3f ms\t\t[%.3f GB/s]\n", 1000.f * overallDuration, GBPerSec(totalBytes, overallDuration));
-
-    //
-    // CS149 TODO: free memory buffers on the GPU using cudaFree
-    //
-    
+void saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultarray) {
+    if (N < 0) throw std::invalid_argument("negative array size");
+    if (N == 0) return;
+    if (!xarray || !yarray || !resultarray)
+        throw std::invalid_argument("null nonempty array");
+    const size_t bytes = sizeof(float) * static_cast<size_t>(N);
+    const int threadsPerBlock = 512;
+    const unsigned blocks = (static_cast<size_t>(N) + threadsPerBlock - 1) / threadsPerBlock;
+    DeviceBuffer x(bytes), y(bytes), result(bytes);
+    // Match the assignment's overall timer: transfers + kernel, excluding allocation.
+    double startTime = CycleTimer::currentSeconds();
+    checked(cudaMemcpy(x.data, xarray, bytes, cudaMemcpyHostToDevice), "copy x to device");
+    checked(cudaMemcpy(y.data, yarray, bytes, cudaMemcpyHostToDevice), "copy y to device");
+    double kernelStart = CycleTimer::currentSeconds();
+    saxpy_kernel<<<blocks, threadsPerBlock>>>(N, alpha, x.data, y.data, result.data);
+    checked(cudaGetLastError(), "launch saxpy");
+    checked(cudaDeviceSynchronize(), "complete saxpy");
+    double kernelEnd = CycleTimer::currentSeconds();
+    checked(cudaMemcpy(resultarray, result.data, bytes, cudaMemcpyDeviceToHost), "copy result to host");
+    double endTime = CycleTimer::currentSeconds();
+    const double gibibytes = 3.0 * bytes / (1024.0 * 1024.0 * 1024.0);
+    printf("SAXPY kernel: %.3f ms [%.3f GiB/s]\n",
+           1000.0 * (kernelEnd-kernelStart), gibibytes/(kernelEnd-kernelStart));
+    printf("SAXPY transfers + kernel: %.3f ms [%.3f GiB/s]\n",
+           1000.0 * (endTime-startTime), gibibytes/(endTime-startTime));
+    x.release(); y.release(); result.release();
 }
 
 void printCudaInfo() {

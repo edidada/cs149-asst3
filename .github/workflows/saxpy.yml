@@ -1,0 +1,57 @@
+name: CS149 CUDA SAXPY
+on:
+  push:
+    branches: [edidada/saxpy]
+  workflow_dispatch:
+    inputs:
+      gpu:
+        description: Run real device tests on a registered self-hosted Linux GPU runner
+        type: boolean
+        default: false
+jobs:
+  compile:
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:12.8.1-devel-ubuntu22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build original application and independent checks (no GPU execution)
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update -qq
+          apt-get install -y -qq make g++
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/commit.txt
+          nvcc --version | tee evidence/toolchain.txt
+          make -C saxpy 2>&1 | tee evidence/build.txt
+          nvcc -O3 -std=c++11 -arch=sm_75 -Isaxpy tests/saxpy_boundaries.cpp saxpy/saxpy.cu -o /tmp/saxpy-boundaries 2>&1 | tee evidence/boundaries-build.txt
+          echo 'COMPILE ONLY: no GPU runtime or performance conclusion' | tee evidence/scope.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: saxpy-compile-evidence
+          path: evidence
+  device:
+    if: github.event_name == 'workflow_dispatch' && inputs.gpu
+    runs-on: [self-hosted, linux, gpu]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Real device correctness and memory checking
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/commit.txt
+          nvidia-smi | tee evidence/device.txt
+          nvcc --version | tee evidence/toolchain.txt
+          make -C saxpy
+          nvcc -O3 -std=c++11 -arch=sm_75 -Isaxpy tests/saxpy_boundaries.cpp saxpy/saxpy.cu -o /tmp/saxpy-boundaries
+          timeout 180 compute-sanitizer --tool memcheck --error-exitcode 1 /tmp/saxpy-boundaries 2>&1 | tee evidence/correctness.txt
+          timeout 180 saxpy/cudaSaxpy 2>&1 | tee evidence/original-100M.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: saxpy-device-evidence
+          path: evidence
