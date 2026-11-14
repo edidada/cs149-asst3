@@ -14,13 +14,13 @@ jobs:
     container: nvidia/cuda:12.8.1-devel-ubuntu22.04
     timeout-minutes: 20
     steps:
+      - name: Install build and checkout dependencies
+        run: apt-get update -qq && apt-get install -y -qq make g++ git
       - uses: actions/checkout@v4
       - name: Build original application and independent checks (no GPU execution)
         shell: bash
         run: |
           set -euo pipefail
-          apt-get update -qq
-          apt-get install -y -qq make g++ git
           mkdir -p evidence
           git rev-parse HEAD > evidence/commit.txt
           nvcc --version | tee evidence/toolchain.txt
